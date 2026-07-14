@@ -1,0 +1,39 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+reid_env/
+
+# Databases
+*.db
+*.db-journal
+
+# Generated folders
+snapshots/
+clips/
+visionguard_memory/
+chroma_db/
+
+# AI models
+*.pt
+*.onnx
+*.tflite
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Backup files
+events_backup_*.db
+
+# CSV exports
+events.csv
