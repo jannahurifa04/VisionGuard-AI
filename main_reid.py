@@ -11,6 +11,7 @@ import imageio.v2 as imageio
 from sklearn.cluster import KMeans
 from reid import get_stable_person_id
 from watchlist import add_watchlist
+from identity_fusion import is_same_person
 
 # =========================
 # SETTINGS
@@ -509,6 +510,8 @@ def crop_person_from_box(frame, box):
 
 person_states = {}
 
+track_to_stable_id = {}
+
 max_buffer_frames = CLIP_SECONDS * CLIP_FPS
 frame_buffer = deque(maxlen=max_buffer_frames)
 
@@ -567,7 +570,18 @@ try:
                 person_crop = crop_person_from_box(frame, box)
                 shirt_color = detect_shirt_color(person_crop)
 
-                stable_id = get_stable_person_id(person_crop, shirt_color)
+                # Use ByteTrack ID first
+                if temp_track_id is not None and temp_track_id in track_to_stable_id:
+                    stable_id = track_to_stable_id[temp_track_id]
+                else:
+                    stable_id = get_stable_person_id(person_crop, shirt_color)
+
+                    if stable_id is None:
+                        continue
+                    
+                    if temp_track_id is not None:
+                        track_to_stable_id[temp_track_id] = stable_id
+
                 update_person_profile(
                     stable_id,
                     shirt_color
@@ -592,7 +606,50 @@ try:
                     f"Shirt={shirt_color}"
                 )
 
-            annotated_frame = results[0].plot()
+            annotated_frame = frame.copy()
+
+            for det in detections:
+                box = det["box"]
+                stable_id = det["stable_id"]
+                shirt_color = det["shirt_color"]
+                confidence = det["confidence"]
+
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+                # Draw bounding box
+                cv2.rectangle(
+                    annotated_frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 255),
+                    2
+                )
+
+                label = (
+                    f"Person ID {stable_id} | "
+                    f"{shirt_color} | "
+                    f"{confidence:.2f}"
+                )
+      
+                # Label background
+                cv2.rectangle(
+                    annotated_frame,
+                    (x1, max(0, y1 - 30)),
+                    (x1 + 320, y1),
+                    (0, 255, 255),
+                    -1
+                )
+
+                # Label text
+                cv2.putText(
+                    annotated_frame,
+                    label,
+                    (x1 + 5, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 0, 0),
+                    2
+            )
 
             cv2.putText(
                 annotated_frame,
