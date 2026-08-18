@@ -37,3 +37,26 @@ events_backup_*.db
 
 # CSV exports
 events.csv
+
+# Identity / ReID private memory
+*.pkl
+
+# Trained clothing model
+*.pth
+
+# Clothing training data
+clothing_color_raw/
+clothing_color_dataset/
+
+# YOLO-World evidence
+object_alerts/
+
+# Identity backups
+identity_backup_*/
+
+# Runtime / local files
+runtime/
+old version/
+
+# Local backup Python files
+*_backup*.py

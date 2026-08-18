@@ -7,6 +7,7 @@ import requests
 import numpy as np
 import time
 import os
+import json
 import re
 import psutil
 import shutil
@@ -16,10 +17,68 @@ from memory import save_incident_memory, search_memory, get_person_profile, get_
 
 app = FastAPI()
 
-CAMERA_URL = "http://192.168.18.152:8080/shot.jpg"
+CAMERA_URL = "http://192.168.18.134:8080/shot.jpg"
 ROTATE_FRAME = True
 SNAPSHOT_FOLDER = "snapshots"
 CLIP_FOLDER = "clips"
+
+# main_reid.py publishes the newest AI-annotated frame here.
+RUNTIME_FOLDER = "runtime"
+PROCESSED_FRAME_PATH = os.path.join(
+    RUNTIME_FOLDER,
+    "latest_annotated.jpg",
+)
+PROCESSED_FRAME_MAX_AGE_SECONDS = 10
+
+# main_reid.py writes the immediate number of YOLO person boxes here.
+# This keeps "People Present" independent from delayed PERSON_LEFT events.
+LIVE_STATUS_PATH = os.path.join(
+    RUNTIME_FOLDER,
+    "live_status.json",
+)
+LIVE_STATUS_MAX_AGE_SECONDS = 15.0
+
+
+def get_live_people_count():
+    """
+    Return how many people are visible in the latest processed camera frame.
+
+    A stale or missing status file returns 0. Event history is not used here,
+    because PERSON_LEFT intentionally waits for MISSING_GRACE_SECONDS.
+    """
+    try:
+        if not os.path.exists(LIVE_STATUS_PATH):
+            return 0
+
+        status_age = (
+            time.time()
+            - os.path.getmtime(LIVE_STATUS_PATH)
+        )
+
+        if status_age > LIVE_STATUS_MAX_AGE_SECONDS:
+            return 0
+
+        with open(
+            LIVE_STATUS_PATH,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            status = json.load(file)
+
+        people_count = int(
+            status.get("people_count", 0)
+        )
+
+        return max(0, people_count)
+
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        # main_reid.py may be replacing the file at this exact moment.
+        return 0
 
 def check_database_status():
     try:
@@ -31,11 +90,23 @@ def check_database_status():
         return "Offline"
 
 def check_camera_status():
+    """
+    Camera status now means the processed VisionGuard AI feed is fresh.
+    """
     try:
-        response = requests.get(CAMERA_URL, timeout=2)
-        if response.status_code == 200 and len(response.content) > 1000:
+        if not os.path.exists(PROCESSED_FRAME_PATH):
+            return "Offline"
+
+        frame_age = (
+            time.time()
+            - os.path.getmtime(PROCESSED_FRAME_PATH)
+        )
+
+        if frame_age <= PROCESSED_FRAME_MAX_AGE_SECONDS:
             return "Online"
+
         return "Offline"
+
     except Exception:
         return "Offline"
 
@@ -1056,12 +1127,29 @@ def ask_visionguard(question):
     """, (today + "%",))
     loitering_today = cursor.fetchone()[0]
 
+    # Count people whose most recent event says they are still in view.
+    # This is different from counting all PERSON_PRESENT events recorded today.
     cursor.execute("""
-        SELECT COUNT(*) FROM events
-        WHERE object_name = 'PERSON_PRESENT'
-        AND event_time LIKE ?
-    """, (today + "%",))
+        SELECT COUNT(*)
+        FROM events AS e
+        INNER JOIN (
+            SELECT person_id, MAX(id) AS latest_event_id
+            FROM events
+            WHERE person_id IS NOT NULL
+            GROUP BY person_id
+        ) AS latest
+            ON e.id = latest.latest_event_id
+        WHERE e.object_name IN (
+            'PERSON_ENTERED',
+            'PERSON_PRESENT',
+            'LOITERING'
+        )
+    """)
     present_today = cursor.fetchone()[0]
+
+    # The dashboard label says "Currently in view", so use the live
+    # per-frame count instead of waiting for a PERSON_LEFT database event.
+    present_today = get_live_people_count()
 
     cursor.execute("""
         SELECT event_time, object_name, snapshot, video_clip, person_id, shirt_color, camera_name
@@ -1285,7 +1373,7 @@ def ask_visionguard(question):
 <b>Summary:</b><br>
 - Total CCTV Events Today: {total_today}<br>
 - Visitor Entry Events: {visitor_entries_today}<br>
-- Person Present Events: {present_today}<br>
+- People Currently Present: {present_today}<br>
 - Loitering Incidents: {loitering_today}<br><br>
 
 <b>Latest Event:</b><br>
@@ -1462,7 +1550,7 @@ def ask_visionguard(question):
             f"Today's CCTV activity:<br>"
             f"- Visitor entry events: {visitor_entries_today}<br>"
             f"- Loitering incidents: {loitering_today}<br>"
-            f"- Person present events: {present_today}<br>"
+            f"- People currently present: {present_today}<br>"
             f"- Total events: {total_today}<br>"
             f"- Latest event: {last_event_text}"
         )
@@ -1531,32 +1619,42 @@ Answer:
 
 
 def generate_camera_frames():
+    """
+    Stream the newest frame already processed by main_reid.py.
+
+    The dashboard no longer opens a separate raw phone-camera stream,
+    so the browser sees the same boxes, names, stable IDs and FACE/BODY
+    source labels shown in the OpenCV AI window.
+    """
     while True:
         try:
-            response = requests.get(CAMERA_URL, timeout=2)
-            img_array = np.array(bytearray(response.content), dtype=np.uint8)
-            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-            if frame is None:
+            if not os.path.exists(PROCESSED_FRAME_PATH):
+                time.sleep(0.2)
                 continue
 
-            if ROTATE_FRAME:
-                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            with open(PROCESSED_FRAME_PATH, "rb") as file:
+                jpeg_bytes = file.read()
 
-            ret, buffer = cv2.imencode(".jpg", frame)
-
-            if not ret:
+            if len(jpeg_bytes) < 1000:
+                time.sleep(0.1)
                 continue
 
             yield (
                 b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Cache-Control: no-cache\r\n\r\n"
+                + jpeg_bytes
+                + b"\r\n"
             )
 
             time.sleep(0.1)
 
-        except Exception as e:
-            print("Camera stream error:", e)
+        except (FileNotFoundError, PermissionError):
+            # main_reid.py may be replacing the file at this exact moment.
+            time.sleep(0.05)
+
+        except Exception as error:
+            print("Processed camera stream error:", error)
             time.sleep(1)
 
 
@@ -1571,6 +1669,13 @@ def video_feed():
 def live_cameras():
     ensure_video_clip_column()
 
+    camera_status = check_camera_status()
+    camera_status_class = (
+        "status"
+        if camera_status == "Online"
+        else "offline-status"
+    )
+
     conn = sqlite3.connect("events.db")
     cursor = conn.cursor()
 
@@ -1583,10 +1688,17 @@ def live_cameras():
     recent_events = cursor.fetchall()
 
     cursor.execute("""
-        SELECT event_time, object_name, person_id, shirt_color
-        FROM events
-        WHERE person_id IS NOT NULL
-        ORDER BY id DESC
+        SELECT
+            e.event_time,
+            e.object_name,
+            e.person_id,
+            e.shirt_color,
+            p.display_name
+        FROM events AS e
+        LEFT JOIN persons AS p
+            ON p.person_id = e.person_id
+        WHERE e.person_id IS NOT NULL
+        ORDER BY e.id DESC
         LIMIT 1
     """)
     latest_person = cursor.fetchone()
@@ -1594,9 +1706,22 @@ def live_cameras():
     conn.close()
 
     if latest_person:
-        last_seen, last_event, person_id, shirt_color = latest_person
+        (
+            last_seen,
+            last_event,
+            person_id,
+            shirt_color,
+            display_name,
+        ) = latest_person
+
+        identity_heading = (
+            f"{display_name} · Person ID {person_id}"
+            if display_name
+            else f"Person ID {person_id}"
+        )
+
         person_html = f"""
-        <h3>Person ID {person_id}</h3>
+        <h3>{identity_heading}</h3>
         <p>Shirt: {shirt_color or "Unknown"}</p>
         <p>Last Event: {last_event}</p>
         <p>Last Seen: {last_seen}</p>
@@ -1683,6 +1808,11 @@ def live_cameras():
                 font-weight: bold;
             }}
 
+            .offline-status {{
+                color: #ef4444;
+                font-weight: bold;
+            }}
+
             .small-grid {{
                 display: grid;
                 grid-template-columns: 1fr 1fr;
@@ -1731,7 +1861,7 @@ def live_cameras():
 
                 <div class="card">
                     <h2>Camera Status</h2>
-                    <p>Status: <span class="status">Online</span></p>
+                    <p>Status: <span class="{camera_status_class}">{camera_status}</span></p>
                     <p>Camera: CAM 01</p>
                     <p>Location: Main Entrance</p>
                     <p>Source: IP Webcam</p>
@@ -2181,12 +2311,29 @@ def home(
     """, (today + "%",))
     loitering_today = cursor.fetchone()[0]
 
+    # Count people whose most recent event says they are still in view.
+    # This is different from counting all PERSON_PRESENT events recorded today.
     cursor.execute("""
-        SELECT COUNT(*) FROM events
-        WHERE object_name = 'PERSON_PRESENT'
-        AND event_time LIKE ?
-    """, (today + "%",))
+        SELECT COUNT(*)
+        FROM events AS e
+        INNER JOIN (
+            SELECT person_id, MAX(id) AS latest_event_id
+            FROM events
+            WHERE person_id IS NOT NULL
+            GROUP BY person_id
+        ) AS latest
+            ON e.id = latest.latest_event_id
+        WHERE e.object_name IN (
+            'PERSON_ENTERED',
+            'PERSON_PRESENT',
+            'LOITERING'
+        )
+    """)
     present_today = cursor.fetchone()[0]
+
+    # The dashboard label says "Currently in view", so use the live
+    # per-frame count instead of waiting for a PERSON_LEFT database event.
+    present_today = get_live_people_count()
 
     cursor.execute("""
         SELECT object_name
@@ -2211,6 +2358,16 @@ def home(
         LIMIT 5
     """)
     recent_for_cards = cursor.fetchall()
+
+    cursor.execute("""
+        SELECT event_time, object_name, snapshot, video_clip, person_id, shirt_color, camera_name
+        FROM events
+        WHERE snapshot IS NOT NULL
+           OR video_clip IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 4
+    """)
+    recent_evidence = cursor.fetchall()
 
     conn.close()
 
@@ -2251,15 +2408,27 @@ def home(
         return "/video_feed"
 
     evidence_cards = ""
-    for event_time, event_name, snapshot, video_clip, person_id, shirt_color, camera_name in recent_for_cards[:4]:
-        image_src = img_for_snapshot(snapshot)
+    for event_time, event_name, snapshot, video_clip, person_id, shirt_color, camera_name in recent_evidence:
         ev_time = time_only(event_time)
         pid = person_label(person_id)
         evidence_buttons = evidence_link(snapshot, video_clip)
+
+        if snapshot:
+            evidence_preview = f'''
+            <img src="/snapshot_file/{snapshot}" class="evidence-img" alt="CCTV evidence snapshot">
+            '''
+        else:
+            evidence_preview = '''
+            <div class="evidence-video-placeholder">
+                <div>🎞️</div>
+                <span>Video Evidence</span>
+            </div>
+            '''
+
         evidence_cards += f"""
         <div class="evidence-card">
             <div class="evidence-img-wrap">
-                <img src="{image_src}" class="evidence-img">
+                {evidence_preview}
                 <span class="time-chip">{ev_time}</span>
             </div>
             <div class="evidence-title">{event_name}</div>
@@ -2269,7 +2438,7 @@ def home(
         """
 
     if not evidence_cards:
-        evidence_cards = "<div class='empty'>No evidence yet.</div>"
+        evidence_cards = "<div class='empty'>No snapshot or video evidence has been saved yet.</div>"
 
     alert_cards = ""
     for event_time, event_name, snapshot, video_clip, person_id, shirt_color, camera_name in recent_for_cards[:3]:
@@ -2371,7 +2540,7 @@ def home(
     <html>
     <head>
         <title>VisionGuard AI Dashboard</title>
-        <meta http-equiv="refresh" content="10">
+        <meta http-equiv="refresh" content="2">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
             * {{ box-sizing: border-box; }}
@@ -2445,6 +2614,29 @@ def home(
             .cam-tile {{ height:70px; border-radius:10px; overflow:hidden; background:#111827; border:1px solid rgba(148,163,184,.16); position:relative; text-align:center; }}
             .cam-tile img {{ width:100%; height:100%; object-fit:cover; opacity:.8; }}
             .cam-tile span {{ position:absolute; bottom:7px; left:0; right:0; font-size:12px; }}
+
+            .offline-camera {{
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                background:rgba(15,23,42,.95);
+                border:1px dashed rgba(148,163,184,.35);
+            }}
+
+            .offline-camera-content {{
+                display:flex;
+                flex-direction:column;
+                align-items:center;
+                justify-content:center;
+                gap:4px;
+                color:#cbd5e1;
+                font-size:12px;
+            }}
+
+            .offline-camera-content small {{
+                color:#ef4444;
+                font-size:10px;
+            }}
             .quick-row {{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px; }}
             .quick-btn {{ text-decoration:none; background:rgba(30,41,59,.85); padding:13px 17px; border-radius:9px; color:#e5e7eb; border:1px solid rgba(148,163,184,.12); }}
             .ask-form {{ display:flex; gap:10px; margin-bottom:15px; }}
@@ -2469,6 +2661,15 @@ def home(
             .evidence-card {{ background:rgba(15,23,42,.88); border-radius:12px; padding:9px; border:1px solid rgba(148,163,184,.12); }}
             .evidence-img-wrap {{ position:relative; height:118px; border-radius:10px; overflow:hidden; }}
             .evidence-img {{ width:100%; height:100%; object-fit:cover; }}
+            .evidence-video-placeholder {{
+                width:100%; height:100%; display:flex; flex-direction:column;
+                align-items:center; justify-content:center; gap:7px;
+                background:linear-gradient(135deg,#111827,#312e81);
+                color:#e0e7ff; font-size:25px;
+            }}
+            .evidence-video-placeholder span {{ font-size:11px; font-weight:bold; }}
+            .section-link {{ color:#c4b5fd; text-decoration:none; font-size:13px; font-weight:bold; }}
+            .section-link:hover {{ color:white; text-decoration:underline; }}
             .time-chip {{ position:absolute; left:7px; bottom:7px; background:rgba(2,6,23,.8); padding:5px 7px; border-radius:7px; font-size:12px; }}
             .evidence-title {{ margin-top:9px; font-weight:bold; font-size:13px; }}
             .mini-actions .view-link, .mini-actions .video-link {{ font-size:11px; padding:5px 7px; margin-top:8px; }}
@@ -2532,11 +2733,38 @@ def home(
                             <div class="cam-label">CAM 01 · Main Entrance</div>
                         </div>
                         <div class="cam-strip">
-                            <div class="cam-tile"><img src="/video_feed"><span>CAM 01</span></div>
-                            <div class="cam-tile"><img src="/video_feed"><span>CAM 02</span></div>
-                            <div class="cam-tile"><img src="/video_feed"><span>CAM 03</span></div>
-                            <div class="cam-tile"><img src="/video_feed"><span>CAM 04</span></div>
-                            <div class="cam-tile"><span style="top:25px;bottom:auto;">+8<br>More Cameras</span></div>
+                            <div class="cam-tile">
+                                <img src="/video_feed">
+                                <span>CAM 01 · LIVE</span>
+                            </div>
+
+                            <div class="cam-tile offline-camera">
+                                <div class="offline-camera-content">
+                                    <b>CAM 02</b>
+                                    <small>Not Connected</small>
+                                </div>
+                            </div>
+
+                            <div class="cam-tile offline-camera">
+                                <div class="offline-camera-content">
+                                    <b>CAM 03</b>
+                                    <small>Not Connected</small>
+                                </div>
+                            </div>
+
+                            <div class="cam-tile offline-camera">
+                                <div class="offline-camera-content">
+                                    <b>CAM 04</b>
+                                    <small>Not Connected</small>
+                                </div>
+                            </div>
+
+                            <div class="cam-tile offline-camera">
+                                <div class="offline-camera-content">
+                                    <b>＋ Add Camera</b>
+                                    <small>Coming Soon</small>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -2561,7 +2789,7 @@ def home(
 
                 <section class="lower-grid">
                     <div class="panel"><h2 class="panel-title">⚠️ ACTIVE ALERTS <span>View all</span></h2>{alert_cards}</div>
-                    <div class="panel"><h2 class="panel-title">🎞️ RECENT EVIDENCE <span>View all</span></h2><div class="evidence-grid">{evidence_cards}</div></div>
+                    <div class="panel"><h2 class="panel-title">🎞️ RECENT EVIDENCE <a class="section-link" href="/evidence">View all →</a></h2><div class="evidence-grid">{evidence_cards}</div></div>
                     <div class="panel"><h2 class="panel-title">🚩 WATCHLIST <span>View all</span></h2>{watchlist_html}</div>
                 </section>
 
@@ -3183,6 +3411,93 @@ renderChat();
 </html>
 """
     return HTMLResponse(html)
+
+@app.get("/evidence", response_class=HTMLResponse)
+def evidence_page():
+    conn = sqlite3.connect("events.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT e.event_time, e.object_name, e.snapshot, e.video_clip,
+               e.person_id, e.shirt_color, e.camera_name, p.display_name
+        FROM events AS e
+        LEFT JOIN persons AS p ON p.person_id = e.person_id
+        WHERE e.snapshot IS NOT NULL OR e.video_clip IS NOT NULL
+        ORDER BY e.id DESC
+        LIMIT 100
+    """)
+    evidence_rows = cursor.fetchall()
+    conn.close()
+
+    cards_html = ""
+    for event_time, event_name, snapshot, video_clip, person_id, shirt_color, camera_name, display_name in evidence_rows:
+        identity_text = (
+            f"{display_name} · Person ID {person_id}"
+            if display_name else person_label(person_id)
+        )
+        if snapshot:
+            preview_html = f'<img src="/snapshot_file/{snapshot}" class="evidence-page-image" alt="CCTV evidence snapshot">'
+        else:
+            preview_html = '<div class="evidence-page-video"><div>🎞️</div><span>Video Evidence</span></div>'
+
+        cards_html += f"""
+        <article class="evidence-page-card">
+            <div class="evidence-page-preview">{preview_html}</div>
+            <div class="evidence-page-body">
+                <h2>{event_name}</h2>
+                <p><b>Identity:</b> {identity_text}</p>
+                <p><b>Time:</b> {event_time}</p>
+                <p><b>Shirt:</b> {shirt_color or 'Unknown'}</p>
+                <p><b>Camera:</b> {camera_name or '-'}</p>
+                <div class="evidence-page-actions">{evidence_link(snapshot, video_clip)}</div>
+            </div>
+        </article>
+        """
+
+    if not cards_html:
+        cards_html = '<div class="empty-message">No snapshot or video evidence has been saved yet.</div>'
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>VisionGuard AI - Evidence</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            * {{ box-sizing:border-box; }}
+            body {{ margin:0; min-height:100vh; font-family:Arial,sans-serif; color:white; background:radial-gradient(circle at top left,#1b1240 0,#080d18 40%,#05070d 100%); }}
+            .page {{ padding:28px; }}
+            .top {{ display:flex; justify-content:space-between; align-items:center; gap:20px; margin-bottom:24px; }}
+            .top h1 {{ margin:0 0 7px; }}
+            .subtitle {{ color:#94a3b8; margin:0; }}
+            .back {{ background:linear-gradient(135deg,#7c3aed,#4f46e5); color:white; padding:11px 16px; border-radius:10px; text-decoration:none; font-weight:bold; }}
+            .evidence-page-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(285px,1fr)); gap:18px; }}
+            .evidence-page-card {{ overflow:hidden; border-radius:16px; background:rgba(15,23,42,.88); border:1px solid rgba(148,163,184,.16); box-shadow:0 16px 42px rgba(0,0,0,.32); }}
+            .evidence-page-preview {{ height:220px; background:#020617; }}
+            .evidence-page-image {{ width:100%; height:100%; object-fit:cover; }}
+            .evidence-page-video {{ width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:linear-gradient(135deg,#111827,#312e81); color:#e0e7ff; font-size:42px; }}
+            .evidence-page-video span {{ font-size:14px; font-weight:bold; }}
+            .evidence-page-body {{ padding:16px; }}
+            .evidence-page-body h2 {{ margin:0 0 12px; color:#c4b5fd; }}
+            .evidence-page-body p {{ margin:8px 0; color:#dbeafe; font-size:14px; }}
+            .evidence-page-actions {{ margin-top:14px; }}
+            .view-link {{ background:#16a34a; color:white; padding:8px 10px; border-radius:8px; text-decoration:none; display:inline-block; margin:2px; font-size:12px; }}
+            .video-link {{ background:#7c3aed; color:white; padding:8px 10px; border-radius:8px; text-decoration:none; display:inline-block; margin:2px; font-size:12px; }}
+            .empty-message {{ padding:30px; border-radius:14px; background:rgba(15,23,42,.88); color:#94a3b8; }}
+        </style>
+    </head>
+    <body>
+        <main class="page">
+            <div class="top">
+                <div><h1>🎞️ Evidence Library</h1><p class="subtitle">Saved CCTV snapshots and video clips</p></div>
+                <a class="back" href="/">← Back to Dashboard</a>
+            </div>
+            <section class="evidence-page-grid">{cards_html}</section>
+        </main>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
 
 @app.get("/analytics", response_class=HTMLResponse)
 def analytics():
