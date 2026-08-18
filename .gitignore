@@ -60,3 +60,8 @@ old version/
 
 # Local backup Python files
 *_backup*.py
+
+# One-time identity cleanup scripts
+merge_duplicate_person_ids.py
+merge_person_id_13_into_11.py
+merge_person_id_14_into_11.py
