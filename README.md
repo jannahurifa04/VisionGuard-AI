@@ -969,6 +969,41 @@ Relevant exclusions are configured through `.gitignore`.
 
 ---
 
+## 🗑️ Privacy & Data Retention
+
+VisionGuard includes configurable privacy and data-retention controls for CCTV evidence and identity information.
+
+Current prototype retention policy:
+
+```text
+Snapshots: 30 days
+Video clips: 30 days
+Event logs: 90 days
+Inactive identity profiles: reviewed after 180 days
+
+```
+
+Privacy features include:
+
+* Automatic cleanup logic for expired snapshots and video clips
+* Automatic cleanup logic for expired event records
+* Detection of inactive person profiles
+* Full person-data deletion support
+* Removal of associated snapshots and video evidence
+* Removal of face and ReID identity memory
+* Deletion audit logging
+
+Retention periods are configurable in:
+
+```text
+privacy_retention.py
+```
+
+The current prototype provides the cleanup logic; production scheduling and customer-specific retention policies can be configured during deployment.
+
+---
+
+
 # 📁 Private Files Excluded From GitHub
 
 Examples include:

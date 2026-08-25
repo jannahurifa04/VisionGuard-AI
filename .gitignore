@@ -65,3 +65,6 @@ old version/
 merge_duplicate_person_ids.py
 merge_person_id_13_into_11.py
 merge_person_id_14_into_11.py
+
+# Privacy retention logs
+deletion_log.txt
