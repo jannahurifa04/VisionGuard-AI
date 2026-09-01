@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, Response
 import sqlite3
 from datetime import datetime
 import cv2
@@ -11,16 +11,21 @@ import json
 import re
 import psutil
 import shutil
+from camera_manager import ensure_camera_table, get_cameras, add_camera
 from rag_engine import build_rag_context
 from watchlist import add_watchlist, get_watchlist, is_watchlisted
 from memory import save_incident_memory, search_memory, get_person_profile, get_person_timeline
 
 app = FastAPI()
+ensure_camera_table()
 
 CAMERA_URL = "http://192.168.18.134:8080/shot.jpg"
 ROTATE_FRAME = True
 SNAPSHOT_FOLDER = "snapshots"
 CLIP_FOLDER = "clips"
+
+OBJECT_ALERT_DATABASE = "object_alerts.db"
+OBJECT_ALERT_FOLDER = "object_alerts"
 
 # main_reid.py publishes the newest AI-annotated frame here.
 RUNTIME_FOLDER = "runtime"
@@ -208,6 +213,42 @@ def check_memory_status():
     except Exception:
         return "Offline"
 
+def get_recent_object_alerts(limit=10):
+    try:
+        if not os.path.exists(OBJECT_ALERT_DATABASE):
+            return []
+
+        conn = sqlite3.connect(
+            OBJECT_ALERT_DATABASE
+        )
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                timestamp,
+                object_name,
+                confidence,
+                snapshot_path
+            FROM object_alerts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        return rows
+
+    except Exception as error:
+        print(
+            f"[OBJECT ALERT DB ERROR] {error}"
+        )
+        return []
+
 def safe_filename(filename: str):
     filename = os.path.basename(filename)
     if ".." in filename or "/" in filename or "\\" in filename:
@@ -268,6 +309,28 @@ def get_snapshot_file(filename: str):
         return FileResponse(filepath)
     return HTMLResponse("Snapshot file not found", status_code=404)
 
+@app.get("/object_alert_file/{filename}")
+def get_object_alert_file(filename: str):
+    filename = safe_filename(filename)
+
+    if not filename:
+        return HTMLResponse(
+            "Invalid object alert filename",
+            status_code=400,
+        )
+
+    filepath = os.path.join(
+        OBJECT_ALERT_FOLDER,
+        filename,
+    )
+
+    if os.path.exists(filepath):
+        return FileResponse(filepath)
+
+    return HTMLResponse(
+        "Object alert image not found",
+        status_code=404,
+    )
 
 @app.get("/clip_file/{filename}")
 def get_clip_file(filename: str):
@@ -2235,11 +2298,185 @@ def settings():
     """
     return HTMLResponse(html)
 
+@app.get("/camera-frame/{camera_code}")
+def camera_frame(camera_code: str):
+    cameras = get_cameras()
+
+    selected_camera = None
+
+    for camera in cameras:
+        (
+            camera_id,
+            saved_code,
+            camera_name,
+            camera_url,
+            enabled,
+        ) = camera
+
+        if saved_code == camera_code and enabled:
+            selected_camera = camera
+            break
+
+    if not selected_camera:
+        return Response(
+            content="Camera not found",
+            status_code=404,
+        )
+
+    camera_url = selected_camera[3]
+
+    try:
+        response = requests.get(
+            camera_url,
+            timeout=3,
+        )
+
+        response.raise_for_status()
+
+        return Response(
+            content=response.content,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store"
+            },
+        )
+
+    except requests.RequestException as error:
+        print(
+            f"[CAMERA ERROR] {camera_code}: {error}"
+        )
+
+        return Response(
+            content="Camera offline",
+            status_code=503,
+        )
+
+@app.get("/add-camera", response_class=HTMLResponse)
+def add_camera_page():
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Add Camera - VisionGuard AI</title>
+        <style>
+            body {
+                margin: 0;
+                background: #070b18;
+                color: white;
+                font-family: Arial, sans-serif;
+            }
+
+            .box {
+                max-width: 520px;
+                margin: 70px auto;
+                background: #111827;
+                padding: 30px;
+                border-radius: 16px;
+            }
+
+            input {
+                width: 100%;
+                padding: 13px;
+                margin: 8px 0 18px;
+                border-radius: 8px;
+                border: 1px solid #374151;
+                box-sizing: border-box;
+            }
+
+            button {
+                background: #6d4cff;
+                color: white;
+                border: 0;
+                padding: 13px 20px;
+                border-radius: 8px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+
+            a {
+                color: #c4b5fd;
+                text-decoration: none;
+                margin-left: 15px;
+            }
+        </style>
+    </head>
+
+    <body>
+        <div class="box">
+            <h1>＋ Add Camera</h1>
+
+            <form action="/save-camera" method="get">
+
+                <label>Camera Code</label>
+                <input
+                    name="camera_code"
+                    placeholder="CAM02"
+                    required
+                >
+
+                <label>Camera Name</label>
+                <input
+                    name="camera_name"
+                    placeholder="Back Entrance"
+                    required
+                >
+
+                <label>Camera URL</label>
+                <input
+                    name="camera_url"
+                    placeholder="http://192.168.1.50:8080/shot.jpg"
+                    required
+                >
+
+                <button type="submit">Add Camera</button>
+
+                <a href="/">Cancel</a>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
+
+@app.get("/save-camera", response_class=HTMLResponse)
+def save_camera(
+    camera_code: str = Query(...),
+    camera_name: str = Query(...),
+    camera_url: str = Query(...),
+):
+    add_camera(
+        camera_code.strip(),
+        camera_name.strip(),
+        camera_url.strip(),
+    )
+
+    return HTMLResponse(
+        """
+        <html>
+        <head>
+            <meta http-equiv="refresh" content="1;url=/">
+        </head>
+        <body style="
+            background:#070b18;
+            color:white;
+            font-family:Arial;
+            text-align:center;
+            padding-top:80px;
+        ">
+            <h2>Camera added successfully ✅</h2>
+            <p>Returning to dashboard...</p>
+        </body>
+        </html>
+        """
+    )
+
 @app.get("/", response_class=HTMLResponse)
 def home(
     q: str = Query(default=""),
     start_date: str = Query(default=""),
     end_date: str = Query(default=""),
+    camera: str = Query(default="CAM01"),
     ask: str = Query(default="")
 ):
     ensure_video_clip_column()
@@ -2260,6 +2497,8 @@ def home(
         save_chat_message(session_id, "assistant", ai_answer)
 
     chat_sessions = get_chat_sessions()
+    object_alerts = get_recent_object_alerts(limit=10)
+    saved_cameras = get_cameras()
 
     conn = sqlite3.connect("events.db")
     cursor = conn.cursor()
@@ -2452,7 +2691,29 @@ def home(
                 <div class="alert-time">{time_only(event_time)}</div>
                 <img src="{img_for_snapshot(snapshot)}" class="alert-thumb">
             </div>
-            """
+            """ 
+    for (
+        alert_id,
+        timestamp,
+        object_name,
+        confidence,
+        snapshot_path,
+    ) in object_alerts[:3]:
+
+        snapshot_filename = os.path.basename(
+            snapshot_path.replace("\\", "/")
+        )
+
+        alert_cards += f"""
+        <div class="alert-row">
+            <div>
+                <b>{object_name.title()}</b><br>
+                <span>YOLO-World Object Alert</span>
+            </div>
+            <div class="alert-time">{time_only(timestamp)}</div>
+            <img src="/object_alert_file/{snapshot_filename}" class="alert-thumb">
+        </div>
+        """  
     if not alert_cards:
         alert_cards = "<div class='empty'>No active alerts.</div>"
 
@@ -2531,6 +2792,79 @@ def home(
 
     if not rows_html:
         rows_html = "<tr><td colspan='6'>No events found.</td></tr>"
+    
+    camera_tiles_html = ""
+
+    for (
+        camera_id,
+        camera_code,
+        camera_name,
+        camera_url,
+        enabled,
+    ) in saved_cameras:
+
+        if enabled:
+            if camera_code == "CAM01":
+                camera_image_url = "/video_feed"
+            else:
+                camera_image_url = f"/camera-frame/{camera_code}"
+
+            camera_tiles_html += f"""
+            <a
+                href="/?camera={camera_code}"
+                class="cam-tile"
+                style="text-decoration:none;color:inherit;"
+            >
+                <img src="{camera_image_url}">
+                <span>{camera_code} · {camera_name}</span>
+            </a>
+            """
+        else:
+            camera_tiles_html += f"""
+            <div class="cam-tile offline-camera">
+                <div class="offline-camera-content">
+                    <b>{camera_code}</b>
+                    <small>{camera_name}</small>
+                </div>
+            </div>
+            """
+
+    camera_tiles_html += """
+    <a href="/add-camera"
+       class="cam-tile offline-camera"
+       style="text-decoration:none;color:inherit;">
+        <div class="offline-camera-content">
+            <b>＋ Add Camera</b>
+            <small>Connect New Camera</small>
+        </div>
+    </a>
+    """
+
+    selected_camera_code = "CAM01"
+    selected_camera_name = "Main Entrance"
+    selected_camera_stream_url = "/video_feed"
+
+    for (
+        selected_id,
+        saved_camera_code,
+        saved_camera_name,
+        saved_camera_url,
+        saved_enabled,
+    ) in saved_cameras:
+
+        if saved_camera_code == camera and saved_enabled:
+            selected_camera_code = saved_camera_code
+            selected_camera_name = saved_camera_name
+
+            if saved_camera_code == "CAM01":
+                selected_camera_stream_url = "/video_feed"
+            else:
+                selected_camera_stream_url = saved_camera_url.replace(
+                    "/shot.jpg",
+                    "/video",
+                )
+
+            break
 
     quick_buttons = ["What happened?", "Who loitered?", "Person ID 1", "Show latest evidence", "Show watchlist"]
     quick_html = "".join([f"<a class='quick-btn' href='/?ask={b}'>{b}</a>" for b in quick_buttons])
@@ -2728,45 +3062,16 @@ def home(
                     <div class="panel">
                         <h2 class="panel-title">📹 LIVE CAMERA FEED <a class="purple-btn" href="/">Refresh</a></h2>
                         <div class="live-wrap">
-                            <img class="camera" src="/video_feed">
+                            <img class="camera" src="{selected_camera_stream_url}">
                             <div class="live-chip">● LIVE</div>
-                            <div class="cam-label">CAM 01 · Main Entrance</div>
+                            <div class="cam-label">{selected_camera_code} · {selected_camera_name}</div>
                         </div>
+
                         <div class="cam-strip">
-                            <div class="cam-tile">
-                                <img src="/video_feed">
-                                <span>CAM 01 · LIVE</span>
-                            </div>
-
-                            <div class="cam-tile offline-camera">
-                                <div class="offline-camera-content">
-                                    <b>CAM 02</b>
-                                    <small>Not Connected</small>
-                                </div>
-                            </div>
-
-                            <div class="cam-tile offline-camera">
-                                <div class="offline-camera-content">
-                                    <b>CAM 03</b>
-                                    <small>Not Connected</small>
-                                </div>
-                            </div>
-
-                            <div class="cam-tile offline-camera">
-                                <div class="offline-camera-content">
-                                    <b>CAM 04</b>
-                                    <small>Not Connected</small>
-                                </div>
-                            </div>
-
-                            <div class="cam-tile offline-camera">
-                                <div class="offline-camera-content">
-                                    <b>＋ Add Camera</b>
-                                    <small>Coming Soon</small>
-                                </div>
-                            </div>
+                            {camera_tiles_html}
                         </div>
-                    </div>
+
+                        </div>
 
                     <div class="panel">
                         <h2 class="panel-title">🧠 VISIONGUARD AI ASSISTANT</h2>

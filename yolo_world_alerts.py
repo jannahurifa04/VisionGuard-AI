@@ -10,7 +10,7 @@ from ultralytics import YOLOWorld
 MODEL_FILE = "yolov8s-worldv2.pt"
 CAMERA_SOURCE = 0
 CONFIDENCE_THRESHOLD = 0.35
-ALERT_COOLDOWN_SECONDS = 10
+ALERT_COOLDOWN_SECONDS = 60
 
 SNAPSHOT_FOLDER = "object_alerts"
 DATABASE_FILE = "object_alerts.db"
