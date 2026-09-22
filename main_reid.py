@@ -183,7 +183,6 @@ os.makedirs(RUNTIME_FOLDER, exist_ok=True)
 # LOAD YOLO MODEL
 # =========================
 
-model = YOLO(MODEL_PATH)
 
 camera_models = {}
 
@@ -2128,6 +2127,16 @@ clothing_mask_cache_time = {}
 max_buffer_frames = CLIP_SECONDS * CLIP_FPS
 frame_buffer = deque(maxlen=max_buffer_frames)
 
+camera_frame_buffers = {}
+
+def get_camera_frame_buffer(camera_code):
+    if camera_code not in camera_frame_buffers:
+        camera_frame_buffers[camera_code] = deque(
+            maxlen=max_buffer_frames
+        )
+
+    return camera_frame_buffers[camera_code]
+
 
 # =========================
 # DASHBOARD FRAME PUBLISHER
@@ -2255,6 +2264,10 @@ try:
         CAMERA_URL = active_camera["url"]
 
         model = get_camera_model(CAMERA_ID)
+
+        active_frame_buffer = get_camera_frame_buffer(
+            CAMERA_ID
+        )
 
         camera_index += 1
 
@@ -3086,7 +3099,9 @@ try:
                 len(visual_detections)
             )
 
-            frame_buffer.append(annotated_frame.copy())
+            active_frame_buffer.append(
+                annotated_frame.copy()
+            )
 
             for det in detections:
                 stable_id = det["stable_id"]
@@ -3152,7 +3167,7 @@ try:
                         )
 
                         video_clip_file = save_video_clip(
-                            frame_buffer,
+                            active_frame_buffer,
                             f"{CAMERA_ID}_LOITERING_PERSON_{stable_id}"
                         )
 
