@@ -17,6 +17,7 @@ import imageio.v2 as imageio
 from reid import get_stable_person_id, extract_embedding, clear_pending_identity
 from watchlist import add_watchlist
 from person_profile import ensure_person_profile
+from camera_manager import ensure_camera_table, get_cameras
 from face_memory import (
     recognize_face,
     register_face_embedding,
@@ -63,6 +64,34 @@ CAMERA_NAME = "Front Camera"
 CAMERA_URL = "http://192.168.18.134:8080/shot.jpg"
 
 DATABASE_NAME = "events.db"
+
+ensure_camera_table()
+
+def get_enabled_camera_configs():
+    camera_configs = []
+
+    for (
+        camera_id,
+        camera_code,
+        camera_name,
+        camera_url,
+        enabled,
+    ) in get_cameras():
+
+        if enabled:
+            camera_configs.append(
+                {
+                    "id": camera_id,
+                    "code": camera_code,
+                    "name": camera_name,
+                    "url": camera_url,
+                }
+            )
+
+    return camera_configs
+
+def make_track_key(camera_code, temp_track_id):
+    return f"{camera_code}:{temp_track_id}"
 
 CONFIDENCE_LIMIT = 0.4
 PERSON_PRESENT_SECONDS = 30
@@ -155,6 +184,15 @@ os.makedirs(RUNTIME_FOLDER, exist_ok=True)
 # =========================
 
 model = YOLO(MODEL_PATH)
+
+camera_models = {}
+
+def get_camera_model(camera_code):
+    if camera_code not in camera_models:
+        camera_models[camera_code] = YOLO(MODEL_PATH)
+        print(f"[CAMERA AI] YOLO tracker created for {camera_code}")
+
+    return camera_models[camera_code]
 
 clothing_parser = FashnHumanParser()
 print("[CLOTHING PARSER] FASHN model loaded")
@@ -2062,6 +2100,9 @@ def find_recent_track_match(
 
 person_states = {}
 
+def make_person_state_key(camera_code, stable_id):
+    return f"{camera_code}:{stable_id}"
+
 track_to_stable_id = {}
 track_embedding_buffers = {}
 track_reference_embeddings = {}
@@ -2193,8 +2234,30 @@ def publish_live_status(people_count):
 # MAIN LOOP
 # =========================
 
+camera_configs = get_enabled_camera_configs()
+
+if not camera_configs:
+    raise RuntimeError("No enabled cameras found in cameras.db")
+
+print(f"[MULTI CAMERA] Enabled cameras: {[camera['code'] for camera in camera_configs]}")
+
+camera_index = 0
+
 try:
     while True:
+
+        active_camera = camera_configs[
+            camera_index % len(camera_configs)
+        ]
+
+        CAMERA_ID = active_camera["code"]
+        CAMERA_NAME = active_camera["name"]
+        CAMERA_URL = active_camera["url"]
+
+        model = get_camera_model(CAMERA_ID)
+
+        camera_index += 1
+
         try:
             response = requests.get(CAMERA_URL, timeout=8)
 
@@ -2238,9 +2301,14 @@ try:
 
                 current_temp_id = int(current_box.id[0])
 
-                if current_temp_id in track_to_stable_id:
+                current_track_key = make_track_key(
+                    CAMERA_ID,
+                    current_temp_id,
+                )
+
+                if current_track_key in track_to_stable_id:
                     reserved_stable_ids.add(
-                        track_to_stable_id[current_temp_id]
+                        track_to_stable_id[current_track_key]
                     )
 
             visual_detections = []
@@ -2257,14 +2325,21 @@ try:
 
                 if box.id is not None:
                     temp_track_id = int(box.id[0])
+               
+                track_key = (
+                    make_track_key(CAMERA_ID, temp_track_id)
+                    if temp_track_id is not None
+                    else None
+                )
 
                 person_crop = crop_person_from_box(frame, box)
+
                 (
                     raw_shirt_color,
                     raw_shirt_confidence,
                 ) = detect_shirt_color(
                     person_crop,
-                    cache_key=temp_track_id,
+                    cache_key=track_key,
                 )
 
                 shirt_color = raw_shirt_color
@@ -2288,27 +2363,27 @@ try:
                     visual_detection["identity_source"] = "TRACKING"
                     continue
 
-                track_last_seen[temp_track_id] = now
+                track_last_seen[track_key] = now
                 track_first_seen.setdefault(
-                    temp_track_id,
+                    track_key,
                     now,
                 )
 
                 stable_id = None
                 face_result = None
                 identity_source = track_identity_source.get(
-                    temp_track_id,
+                    track_key,
                     "IDENTIFYING",
                 )
 
                 # -----------------------------------------------------
                 # Existing ByteTrack session
                 # -----------------------------------------------------
-                if temp_track_id in track_to_stable_id:
-                    stable_id = track_to_stable_id[temp_track_id]
+                if track_key in track_to_stable_id:
+                    stable_id = track_to_stable_id[track_key]
 
                     previous_face_check = track_last_face_check.get(
-                        temp_track_id
+                        track_key
                     )
 
                     should_check_face = (
@@ -2328,7 +2403,7 @@ try:
                             person_crop,
                             excluded_person_ids=excluded_face_ids,
                         )
-                        track_last_face_check[temp_track_id] = now
+                        track_last_face_check[track_key] = now
 
                         face_match_id = face_result.get("person_id")
                         face_score = float(
@@ -2337,9 +2412,9 @@ try:
 
                         if face_match_id == stable_id:
                             identity_source = "FACE"
-                            track_identity_source[temp_track_id] = "FACE"
+                            track_identity_source[track_key] = "FACE"
                             track_face_override_votes.pop(
-                                temp_track_id,
+                                track_key,
                                 None,
                             )
 
@@ -2354,7 +2429,7 @@ try:
                             and face_match_id != stable_id
                         ):
                             current_source = track_identity_source.get(
-                                temp_track_id,
+                                track_key,
                                 identity_source,
                             )
 
@@ -2369,7 +2444,7 @@ try:
                                 )
                             ):
                                 vote_data = track_face_override_votes.get(
-                                    temp_track_id,
+                                    track_key,
                                     {
                                         "person_id": face_match_id,
                                         "count": 0,
@@ -2384,7 +2459,7 @@ try:
 
                                 vote_data["count"] += 1
                                 track_face_override_votes[
-                                    temp_track_id
+                                    track_key
                                 ] = vote_data
 
                                 print(
@@ -2404,14 +2479,24 @@ try:
                                     stable_id = face_match_id
                                     identity_source = "FACE"
 
+                                    old_person_state_key = make_person_state_key(
+                                        CAMERA_ID,
+                                        old_stable_id,
+                                    )
+
+                                    new_person_state_key = make_person_state_key(
+                                        CAMERA_ID,
+                                        stable_id,
+                                    )
+
                                     track_to_stable_id[
-                                        temp_track_id
+                                        track_key
                                     ] = stable_id
                                     track_identity_source[
-                                        temp_track_id
+                                        track_key
                                     ] = "FACE"
                                     track_face_override_votes.pop(
-                                        temp_track_id,
+                                        track_key,
                                         None,
                                     )
 
@@ -2423,17 +2508,21 @@ try:
                                     # Move temporary runtime state if the old
                                     # provisional BODY ID had already started.
                                     if (
-                                        old_stable_id in person_states
-                                        and stable_id not in person_states
+                                        old_person_state_key in person_states
+                                        and new_person_state_key not in person_states
                                     ):
-                                        person_states[stable_id] = (
+                                        person_states[new_person_state_key] = (
                                             person_states.pop(
-                                                old_stable_id
+                                                old_person_state_key
                                             )
                                         )
-                                    elif old_stable_id in person_states:
+                                        person_states[
+                                        new_person_state_key
+                                        ]["stable_id"] = stable_id
+
+                                    elif old_person_state_key in person_states:
                                         person_states.pop(
-                                            old_stable_id,
+                                            old_person_state_key,
                                             None,
                                         )
 
@@ -2476,7 +2565,7 @@ try:
                 # -----------------------------------------------------
                 else:
                     previous_face_check = track_last_face_check.get(
-                        temp_track_id
+                        track_key
                     )
 
                     should_check_face = (
@@ -2496,7 +2585,7 @@ try:
                             person_crop,
                             excluded_person_ids=excluded_face_ids,
                         )
-                        track_last_face_check[temp_track_id] = now
+                        track_last_face_check[track_key] = now
                     else:
                         face_result = {
                             "person_id": None,
@@ -2512,13 +2601,13 @@ try:
                         stable_id = face_match_id
                         identity_source = "FACE"
 
-                        clear_pending_identity(temp_track_id)
+                        clear_pending_identity(track_key)
                         track_embedding_buffers.pop(
-                            temp_track_id,
+                            track_key,
                             None,
                         )
                         track_unknown_face_embeddings.pop(
-                            temp_track_id,
+                            track_key,
                             None,
                         )
 
@@ -2526,7 +2615,7 @@ try:
 
                         if body_reference is not None:
                             track_reference_embeddings[
-                                temp_track_id
+                                track_key
                             ] = body_reference
 
                         update_verified_face_gallery(
@@ -2552,7 +2641,7 @@ try:
                         if unknown_face_embedding is not None:
                             unknown_buffer = (
                                 track_unknown_face_embeddings.setdefault(
-                                    temp_track_id,
+                                    track_key,
                                     [],
                                 )
                             )
@@ -2565,7 +2654,7 @@ try:
                                 > UNKNOWN_FACE_BUFFER_SIZE
                             ):
                                 track_unknown_face_embeddings[
-                                    temp_track_id
+                                    track_key
                                 ] = unknown_buffer[
                                     -UNKNOWN_FACE_BUFFER_SIZE:
                                 ]
@@ -2581,17 +2670,17 @@ try:
                             continue
 
                         buffer = track_embedding_buffers.setdefault(
-                            temp_track_id,
+                            track_key,
                             [],
                         )
                         buffer.append(current_embedding)
 
                         if len(buffer) > MIN_REID_FRAMES:
                             track_embedding_buffers[
-                                temp_track_id
+                                track_key
                             ] = buffer[-MIN_REID_FRAMES:]
                             buffer = track_embedding_buffers[
-                                temp_track_id
+                                track_key
                             ]
 
                         collected_frames = len(buffer)
@@ -2618,7 +2707,7 @@ try:
 
                         if average_embedding is None:
                             track_embedding_buffers.pop(
-                                temp_track_id,
+                                track_key,
                                 None,
                             )
                             continue
@@ -2636,7 +2725,7 @@ try:
                         if recovered_id is not None:
                             stable_id = recovered_id
                             identity_source = "RECENT BODY"
-                            clear_pending_identity(temp_track_id)
+                            clear_pending_identity(track_key)
 
                             print(
                                 f"[TRACK RECOVERED] Temp ID="
@@ -2647,7 +2736,7 @@ try:
                         else:
                             pending_seconds = (
                                 now
-                                - track_first_seen[temp_track_id]
+                                - track_first_seen[track_key]
                             ).total_seconds()
 
                             if (
@@ -2676,7 +2765,7 @@ try:
                                 person_crop=None,
                                 shirt_color=shirt_color,
                                 embedding=average_embedding,
-                                track_key=temp_track_id,
+                                track_key=track_key,
                             )
                             identity_source = "BODY PROVISIONAL"
 
@@ -2684,14 +2773,14 @@ try:
                             continue
 
                         track_reference_embeddings[
-                            temp_track_id
+                            track_key
                         ] = average_embedding
 
                         # Register an unknown person's face only after
                         # several clear face embeddings agree over time.
                         unknown_buffer = (
                             track_unknown_face_embeddings.get(
-                                temp_track_id,
+                                track_key,
                                 [],
                             )
                         )
@@ -2735,13 +2824,13 @@ try:
                         continue
 
                     track_to_stable_id[
-                        temp_track_id
+                        track_key
                     ] = stable_id
                     track_identity_source[
-                        temp_track_id
+                        track_key
                     ] = identity_source
                     track_embedding_buffers.pop(
-                        temp_track_id,
+                        track_key,
                         None,
                     )
                     reserved_stable_ids.add(stable_id)
@@ -2764,7 +2853,7 @@ try:
 
                 reference_embedding = (
                     track_reference_embeddings.get(
-                        temp_track_id
+                        track_key
                     )
                 )
 
@@ -2806,7 +2895,7 @@ try:
                     stable_id
                 )
                 identity_source = track_identity_source.get(
-                    temp_track_id,
+                    track_key,
                     identity_source,
                 )
 
@@ -3003,9 +3092,16 @@ try:
                 stable_id = det["stable_id"]
                 confidence = det["confidence"]
                 shirt_color = det["shirt_color"]
+      
+                person_state_key = make_person_state_key(
+                    CAMERA_ID,
+                    stable_id,
+                )
 
-                if stable_id not in person_states:
-                    person_states[stable_id] = {
+                if person_state_key not in person_states:
+                    person_states[person_state_key] = {
+                        "camera_id": CAMERA_ID,
+                        "stable_id": stable_id,
                         "present": False,
                         "enter_time": None,
                         "last_seen": now,
@@ -3015,7 +3111,7 @@ try:
                         "confidence": confidence
                     }
 
-                state = person_states[stable_id]
+                state = person_states[person_state_key]
                 state["last_seen"] = now
                 state["shirt_color"] = shirt_color
                 state["confidence"] = confidence
@@ -3071,15 +3167,20 @@ try:
 
                         state["loitering_logged"] = True
 
-            for stable_id, state in list(person_states.items()):
-                if state["present"] and stable_id not in current_seen_ids:
+            for person_state_key, state in list(person_states.items()):
+                if state["camera_id"] != CAMERA_ID:
+                    continue
+
+                state_stable_id = state["stable_id"]
+                if state["present"] and state_stable_id not in current_seen_ids:
+
                     missing_seconds = (now - state["last_seen"]).total_seconds()
 
                     if missing_seconds >= MISSING_GRACE_SECONDS:
                         save_event(
                             "PERSON_LEFT",
                             1.0,
-                            person_id=stable_id,
+                            person_id=state_stable_id,
                             shirt_color=state["shirt_color"]
                         )
 
@@ -3089,7 +3190,7 @@ try:
                         state["loitering_logged"] = False
 
                         # A later visit may use different clothing.
-                        reset_shirt_colour_visit(stable_id)
+                        reset_shirt_colour_visit(state_stable_id)
 
             cv2.imshow("AI CCTV - Multi Person ReID", annotated_frame)
 
