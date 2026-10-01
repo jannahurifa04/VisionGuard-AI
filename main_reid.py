@@ -179,6 +179,19 @@ PROCESSED_FRAME_JPEG_QUALITY = 88
 
 os.makedirs(RUNTIME_FOLDER, exist_ok=True)
 
+def get_camera_processed_frame_path(camera_code):
+    return os.path.join(
+        RUNTIME_FOLDER,
+        f"{camera_code}_latest_annotated.jpg",
+    )
+
+
+def get_camera_live_status_path(camera_code):
+    return os.path.join(
+        RUNTIME_FOLDER,
+        f"{camera_code}_live_status.json",
+    )
+
 # =========================
 # LOAD YOLO MODEL
 # =========================
@@ -2142,15 +2155,21 @@ def get_camera_frame_buffer(camera_code):
 # DASHBOARD FRAME PUBLISHER
 # =========================
 
-def publish_processed_frame(frame):
+def publish_processed_frame(frame, camera_code=None):
     """
-    Publish the newest annotated AI frame for dashboard.py.
+    Publish the newest annotated AI frame for dashboard.py
 
     A temporary file is written first and then atomically replaced,
     preventing the dashboard from reading a half-written JPEG.
     """
     if frame is None or frame.size == 0:
         return False
+
+    destination_path = (
+        get_camera_processed_frame_path(camera_code)
+        if camera_code
+        else PROCESSED_FRAME_PATH
+    )
 
     try:
         success, encoded = cv2.imencode(
@@ -2166,7 +2185,7 @@ def publish_processed_frame(frame):
             return False
 
         temporary_path = (
-            PROCESSED_FRAME_PATH
+            destination_path
             + f".{os.getpid()}.tmp.jpg"
         )
 
@@ -2179,7 +2198,7 @@ def publish_processed_frame(frame):
             try:
                 os.replace(
                     temporary_path,
-                    PROCESSED_FRAME_PATH,
+                    destination_path,
                 )
                 return True
             except PermissionError:
@@ -2196,10 +2215,17 @@ def publish_processed_frame(frame):
         print(f"[PROCESSED FEED ERROR] {error}")
         return False
 
-def publish_live_status(people_count):
+def publish_live_status(people_count, camera_code=None):
     """
     Publish the immediate number of people visible in the latest frame.
     """
+
+    destination_path = (
+        get_camera_live_status_path(camera_code)
+        if camera_code
+        else LIVE_STATUS_PATH
+    )
+
     try:
         status_data = {
             "people_count": max(0, int(people_count)),
@@ -2207,7 +2233,7 @@ def publish_live_status(people_count):
         }
 
         temporary_path = (
-            LIVE_STATUS_PATH
+            destination_path
             + f".{os.getpid()}.tmp"
         )
 
@@ -2222,7 +2248,7 @@ def publish_live_status(people_count):
             try:
                 os.replace(
                     temporary_path,
-                    LIVE_STATUS_PATH,
+                    destination_path,
                 )
                 return True
             except PermissionError:
@@ -3094,9 +3120,17 @@ try:
 
             # Make the exact annotated AI frame available to FastAPI.
             publish_processed_frame(annotated_frame)
+            publish_processed_frame(
+                annotated_frame,
+                camera_code=CAMERA_ID,
+            )
 
             publish_live_status(
                 len(visual_detections)
+            )
+            publish_live_status(
+                len(visual_detections),
+                camera_code=CAMERA_ID,
             )
 
             active_frame_buffer.append(
