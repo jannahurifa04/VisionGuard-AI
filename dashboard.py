@@ -1679,9 +1679,7 @@ Answer:
         return f"Ollama error: {e}"
 
 
-
-
-def generate_camera_frames():
+def generate_camera_frames(camera_code=None):
     """
     Stream the newest frame already processed by main_reid.py.
 
@@ -1689,13 +1687,22 @@ def generate_camera_frames():
     so the browser sees the same boxes, names, stable IDs and FACE/BODY
     source labels shown in the OpenCV AI window.
     """
+    destination_path = (
+        os.path.join(
+            RUNTIME_FOLDER,
+            f"{camera_code}_latest_annotated.jpg",
+        )
+        if camera_code
+        else PROCESSED_FRAME_PATH
+    )
+
     while True:
         try:
-            if not os.path.exists(PROCESSED_FRAME_PATH):
+            if not os.path.exists(destination_path):
                 time.sleep(0.2)
                 continue
 
-            with open(PROCESSED_FRAME_PATH, "rb") as file:
+            with open(destination_path, "rb") as file:
                 jpeg_bytes = file.read()
 
             if len(jpeg_bytes) < 1000:
@@ -1725,6 +1732,13 @@ def generate_camera_frames():
 def video_feed():
     return StreamingResponse(
         generate_camera_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+@app.get("/video_feed/{camera_code}")
+def video_feed_camera(camera_code: str):
+    return StreamingResponse(
+        generate_camera_frames(camera_code=camera_code),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
@@ -2804,10 +2818,7 @@ def home(
     ) in saved_cameras:
 
         if enabled:
-            if camera_code == "CAM01":
-                camera_image_url = "/video_feed"
-            else:
-                camera_image_url = f"/camera-frame/{camera_code}"
+            camera_image_url = f"/video_feed/{camera_code}"
 
             camera_tiles_html += f"""
             <a
@@ -2842,7 +2853,7 @@ def home(
 
     selected_camera_code = "CAM01"
     selected_camera_name = "Main Entrance"
-    selected_camera_stream_url = "/video_feed"
+    selected_camera_stream_url = "/video_feed/CAM01"
 
     for (
         selected_id,
@@ -2857,12 +2868,9 @@ def home(
             selected_camera_name = saved_camera_name
 
             if saved_camera_code == "CAM01":
-                selected_camera_stream_url = "/video_feed"
+                selected_camera_stream_url = "/video_feed/CAM01"
             else:
-                selected_camera_stream_url = saved_camera_url.replace(
-                    "/shot.jpg",
-                    "/video",
-                )
+                selected_camera_stream_url = f"/video_feed/{saved_camera_code}"
 
             break
 
