@@ -16,6 +16,13 @@ from rag_engine import build_rag_context
 from watchlist import add_watchlist, get_watchlist, is_watchlisted
 from memory import save_incident_memory, search_memory, get_person_profile, get_person_timeline
 
+from agent_tools import (
+    search_events,
+    get_person_journey,
+    get_latest_evidence,
+    get_people_present,
+)
+
 app = FastAPI()
 ensure_camera_table()
 
@@ -1217,10 +1224,9 @@ def ask_visionguard(question):
     cursor.execute("""
         SELECT event_time, object_name, snapshot, video_clip, person_id, shirt_color, camera_name
         FROM events
-        WHERE event_time LIKE ?
         ORDER BY id DESC
         LIMIT 10
-    """, (today + "%",))
+    """)
     recent_events = cursor.fetchall()
 
     cursor.execute("""
@@ -1743,8 +1749,30 @@ def video_feed_camera(camera_code: str):
     )
 
 @app.get("/live-cameras", response_class=HTMLResponse)
-def live_cameras():
+def live_cameras(camera: str = Query(default="CAM01")):
     ensure_video_clip_column()
+
+    saved_cameras = get_cameras()
+
+    selected_camera_code = "CAM01"
+    selected_camera_name = "Main Entrance"
+
+    for (
+        saved_camera_id,
+        saved_camera_code,
+        saved_camera_name,
+        saved_camera_url,
+        saved_enabled,
+    ) in saved_cameras:
+
+        if saved_camera_code == camera and saved_enabled:
+            selected_camera_code = saved_camera_code
+            selected_camera_name = saved_camera_name
+            break
+
+    selected_camera_stream_url = (
+        f"/video_feed/{selected_camera_code}"
+    )
 
     camera_status = check_camera_status()
     camera_status_class = (
@@ -1759,9 +1787,10 @@ def live_cameras():
     cursor.execute("""
         SELECT event_time, object_name, snapshot, video_clip, person_id, shirt_color, camera_name
         FROM events
+        WHERE camera_id = ?
         ORDER BY id DESC
         LIMIT 10
-    """)
+    """, (selected_camera_code,))
     recent_events = cursor.fetchall()
 
     cursor.execute("""
@@ -1930,19 +1959,49 @@ def live_cameras():
                 <a class="back" href="/">← Back to Dashboard</a>
             </div>
 
+            <div style="display:flex; gap:10px; margin-bottom:18px;">
+
+                <a href="/live-cameras?camera=CAM01"
+                   style="
+                       padding:10px 16px;
+                       border-radius:9px;
+                       text-decoration:none;
+                       font-weight:bold;
+                       color:white;
+                       background:{'#6d4cff' if selected_camera_code == 'CAM01' else '#1f2937'};
+                       border:1px solid #6d4cff;
+                   ">
+                    CAM01 · Main Entrance
+                </a>
+
+                <a href="/live-cameras?camera=CAM02"
+                   style="
+                       padding:10px 16px;
+                       border-radius:9px;
+                       text-decoration:none;
+                       font-weight:bold;
+                       color:white;
+                       background:{'#6d4cff' if selected_camera_code == 'CAM02' else '#1f2937'};
+                       border:1px solid #6d4cff;
+                   ">
+                    CAM02 · Back Entrance
+                </a>
+
+            </div>
+
             <div class="grid">
                 <div class="card">
-                    <h2>CAM 01 - Main Entrance</h2>
-                    <img class="camera" src="/video_feed">
+                    <h2>{selected_camera_code} - {selected_camera_name}</h2>
+                    <img class="camera" src="{selected_camera_stream_url}">
                 </div>
 
                 <div class="card">
                     <h2>Camera Status</h2>
                     <p>Status: <span class="{camera_status_class}">{camera_status}</span></p>
-                    <p>Camera: CAM 01</p>
-                    <p>Location: Main Entrance</p>
+                    <p>Camera: {selected_camera_code}</p>
+                    <p>Location: {selected_camera_name}</p>
                     <p>Source: IP Webcam</p>
-                    <p>Stream: /video_feed</p>
+                    <p>Stream: {selected_camera_stream_url}</p>
                 </div>
             </div>
 
