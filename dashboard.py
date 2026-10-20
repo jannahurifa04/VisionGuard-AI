@@ -23,6 +23,262 @@ from agent_tools import (
     get_people_present,
 )
 
+def execute_agent_tool(tool_name, arguments):
+    """
+    Safely execute a VisionGuard agent tool.
+    """
+
+    tool_config = {
+        "search_events": (
+            search_events,
+            {"person_id", "camera_id", "event_type", "limit"},
+        ),
+        "get_person_journey": (
+            get_person_journey,
+            {"person_id", "date", "limit"},
+        ),
+        "get_latest_evidence": (
+            get_latest_evidence,
+            {"person_id", "camera_id", "event_type"},
+        ),
+        "get_people_present": (
+            get_people_present,
+            {"camera_id", "max_age_minutes"},
+        ),
+    }
+
+    if tool_name not in tool_config:
+        return {
+            "error": f"Unknown agent tool: {tool_name}"
+        }
+
+    if not isinstance(arguments, dict):
+        return {
+            "error": "Agent tool arguments must be a dictionary."
+        }
+
+    tool_function, allowed_arguments = tool_config[tool_name]
+
+    unexpected_arguments = (
+        set(arguments.keys()) - allowed_arguments
+    )
+
+    if unexpected_arguments:
+        return {
+            "error": (
+                f"Invalid arguments for {tool_name}: "
+                f"{sorted(unexpected_arguments)}"
+            )
+        }
+
+    try:
+        return tool_function(**arguments)
+
+    except Exception as error:
+        return {
+            "error": f"{tool_name} failed: {error}"
+        }
+
+
+def choose_agent_tool(question):
+    """
+    Ask the local LLM which VisionGuard tool should handle the question.
+    """
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    question_lower = question.lower()
+
+    person_match = re.search(
+        r"person\s*(?:id\s*)?(\d+)",
+        question_lower,
+    )
+
+    date_match = re.search(
+        r"\b(20\d{2}-\d{2}-\d{2})\b",
+        question,
+    )
+
+    if (
+        person_match
+        and date_match
+        and "where" in question_lower
+    ):
+        return {
+            "tool": "get_person_journey",
+            "arguments": {
+                "person_id": int(person_match.group(1)),
+                "date": date_match.group(1),
+            },
+        }
+
+    prompt = f"""
+
+You are the VisionGuard AI tool router.
+
+Choose ONE tool for the user's CCTV question.
+
+Available tools:
+
+1. search_events
+Arguments:
+person_id, camera_id, event_type, limit
+
+2. get_person_journey
+Arguments:
+person_id, date, limit
+
+3. get_latest_evidence
+Arguments:
+person_id, camera_id, event_type
+
+4. get_people_present
+Arguments:
+camera_id, max_age_minutes
+
+Routing rules:
+- If the question asks where a specific person was on a specific date, ALWAYS use get_person_journey.
+- search_events must NEVER receive a date argument.
+- get_person_journey may only use person_id, date, and limit.
+- get_latest_evidence may only use person_id, camera_id, and event_type.
+- get_people_present may only use camera_id and max_age_minutes.
+- NEVER include arguments that are not listed for the selected tool.
+
+Today's date: {today}
+
+Return ONLY JSON.
+
+Example:
+{{"tool":"get_person_journey","arguments":{{"person_id":11,"date":"2026-10-08"}}}}
+
+If no tool is appropriate:
+{{"tool":null,"arguments":{{}}}}
+
+User question:
+{question}
+"""
+
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3.2:1b",
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+            },
+            timeout=60,
+        )
+
+        data = response.json()
+        result = json.loads(
+            data.get("response", "{}")
+        )
+
+        return result
+
+    except Exception as error:
+        return {
+            "tool": None,
+            "arguments": {},
+            "error": str(error),
+        }
+
+def summarize_agent_result(question, tool_name, tool_result):
+    """
+    Turn a VisionGuard tool result into a natural-language answer.
+    """
+
+    if isinstance(tool_result, dict) and tool_result.get("error"):
+        return f"VisionGuard tool error: {tool_result['error']}"
+
+    if tool_name == "get_person_journey":
+        if not isinstance(tool_result, list) or not tool_result:
+            return "No matching CCTV records were found."
+
+        person_id = tool_result[0].get("person_id")
+
+        lines = [
+            f"Person ID {person_id} journey:"
+        ]
+
+        evidence_found = False
+
+        for event in tool_result:
+            event_time = event.get("event_time", "Unknown time")
+            camera_id = event.get("camera_id", "Unknown camera")
+            camera_name = event.get("camera_name", "Unknown location")
+            event_type = event.get("object_name", "Unknown event")
+
+            lines.append(
+                f"- {event_time} — "
+                f"{camera_name} ({camera_id}) — "
+                f"{event_type}"
+            )
+
+            if event.get("snapshot") or event.get("video_clip"):
+                evidence_found = True
+
+        if evidence_found:
+            lines.append(
+                "Evidence is available for one or more events."
+            )
+
+        return "\n".join(lines)
+
+    result_text = json.dumps(
+        tool_result,
+        ensure_ascii=False,
+        default=str,
+    )
+
+    prompt = f"""
+You are VisionGuard AI, an intelligent CCTV security assistant.
+
+Answer the user's question using ONLY the VisionGuard tool result below.
+
+Rules:
+- Do not invent any person, event, camera, time, identity, or evidence.
+- Use exact Person IDs, camera names, event times, and event types from the data.
+- Summarize clearly instead of dumping raw JSON.
+- Mention snapshot or video evidence when it exists.
+- If the result is empty, say that no matching CCTV records were found.
+- Answer in the same language as the user's question.
+
+User question:
+{question}
+
+Tool used:
+{tool_name}
+
+VisionGuard tool result:
+{result_text}
+
+Answer:
+"""
+
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3.2:1b",
+                "prompt": prompt,
+                "stream": False,
+            },
+            timeout=60,
+        )
+
+        data = response.json()
+
+        return data.get(
+            "response",
+            "VisionGuard could not generate an answer.",
+        )
+
+    except Exception as error:
+        return f"VisionGuard answer error: {error}"
+
+
 app = FastAPI()
 ensure_camera_table()
 
