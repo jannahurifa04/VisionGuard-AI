@@ -1433,6 +1433,26 @@ def ask_visionguard(question):
     question = question.strip()
     question_lower = question.lower()
 
+    agent_choice = choose_agent_tool(question)
+    agent_tool = agent_choice.get("tool")
+    agent_arguments = agent_choice.get("arguments", {})
+
+    if agent_tool:
+        agent_result = execute_agent_tool(
+            agent_tool,
+            agent_arguments,
+        )
+
+        if not (
+            isinstance(agent_result, dict)
+            and agent_result.get("error")
+        ):
+            return summarize_agent_result(
+                question,
+                agent_tool,
+                agent_result,
+            )
+
     conn = sqlite3.connect("events.db")
     cursor = conn.cursor()
 
